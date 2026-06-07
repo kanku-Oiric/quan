@@ -1,0 +1,23 @@
+# Environment variables — JANGAN PERNAH PUSH
+.env
+.env.local
+.env.*.local
+.env.development
+.env.production
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+venv/
+.venv/
+*.egg-info/
+
+# Supabase / credentials
+*.key
+*.pem
+secrets.json
+
+# OS
+.DS_Store
+Thumbs.db
