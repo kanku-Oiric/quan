@@ -1,10 +1,27 @@
 import os
+import re                               # FIX A: pindah ke atas, bukan di dalam fungsi
+import json                             # FIX B: pindah ke atas, bukan di dalam fungsi
 import warnings
 from google import genai
 from pypdf import PdfReader
+from pydantic import BaseModel          # FIX C: pindah ke atas, bukan di dalam fungsi
 
-# Sembunyikan warning biar terminal rapi
 warnings.filterwarnings("ignore")
+
+# =====================================================================
+# KONSTANTA — FIX D: gak ada lagi magic number tersebar di fungsi
+# =====================================================================
+GEMINI_MODEL      = "gemini-2.5-flash"
+PDF_CHAR_LIMIT    = 8000               # FIX 5: dinaikkan dari 4000 → 8000, mudah diubah di sini
+FILENAME_MAX_LEN  = 100
+
+# =====================================================================
+# SCHEMA PYDANTIC — FIX C: definisi di level modul, bukan di-recreate
+#                           setiap kali analyze_and_link() dipanggil
+# =====================================================================
+class ObsidianNoteSchema(BaseModel):
+    judul: str
+    konten: str
 
 class AIResearcher:
     def __init__(self, api_key: str, obsidian_path: str):
@@ -12,32 +29,47 @@ class AIResearcher:
         self.obsidian_path = obsidian_path
 
     def extract_text_from_pdf(self, pdf_path: str) -> str:
-        """Fungsi pembantu buat nge-ekstrak teks dari file PDF secara lokal"""
+        """Ekstrak teks dari file PDF secara lokal, dibatasi PDF_CHAR_LIMIT karakter."""
         if not os.path.exists(pdf_path):
             return ""
         try:
             reader = PdfReader(pdf_path)
             text = ""
             for page in reader.pages:
-                text += page.extract_text() + "\n"
-            return text
+                extracted = page.extract_text()
+                if extracted:
+                    text += extracted + "\n"
+                # FIX 5: stop lebih awal kalau sudah melewati limit,
+                # daripada ekstrak semua baru dipotong di akhir
+                if len(text) >= PDF_CHAR_LIMIT:
+                    break
+            return text[:PDF_CHAR_LIMIT]
         except Exception as e:
             print(f"Error ekstrak PDF: {e}")
             return ""
 
-    def analyze_and_link(self, discord_chat: str, pdf_path: str = None, file_relevan_nama: str = "", file_relevan_konten: str = "", daftar_semua_judul: list = None) -> dict:
+    def analyze_and_link(
+        self,
+        discord_chat: str,
+        pdf_path: str = None,
+        file_relevan_nama: str = "",
+        file_relevan_konten: str = "",
+        daftar_semua_judul: list = None
+    ) -> dict | None:
         """
-        Fungsi yang sudah diperbaiki pertahanan JSON-nya dari karakter kontrol liar.
+        Pipeline utama: bangun prompt → kirim ke Gemini → parse JSON.
+        Return dict {judul, konten} atau None jika gagal.
         """
-        format_judul_saja = "\n".join([f"- {j}" for j in daftar_semua_judul]) if daftar_semua_judul else "Belum ada file."
+        format_judul_saja = (
+            "\n".join([f"- {j}" for j in daftar_semua_judul])
+            if daftar_semua_judul else "Belum ada file."
+        )
 
         pdf_context = ""
         if pdf_path:
             print(f"--> [Researcher] Mengekstrak teks dari PDF...")
             pdf_context = self.extract_text_from_pdf(pdf_path)
-            pdf_context = pdf_context[:4000] 
 
-        # PROMPT DENGAN GUARDRAILS & RISK BOUNDING
         prompt = f"""
 Lu adalah AI Knowledge Architect dan Strategic Risk Analyst untuk Obsidian Second Brain.
 Fokus: mental models, probabilistic thinking, dan sistem dinamik.
@@ -131,25 +163,17 @@ Contoh yang salah: "Note ini berkaitan dengan [[file_relevan_nama]] karena memba
 """
 
         print("--> [Researcher] Mengirim prompt ke Gemini API...")
-        
-        # Siasat mengamankan skema objek JSON
-        from pydantic import BaseModel
-        class ObsidianNoteSchema(BaseModel):
-            judul: str
-            konten: str
-
         response = self.client.models.generate_content(
-            model='gemini-2.5-flash',
+            model=GEMINI_MODEL,                         # FIX D: pakai konstanta
             contents=prompt,
             config={
                 "response_mime_type": "application/json",
-                "response_schema": ObsidianNoteSchema # Memaksa Gemini mengikuti blueprint Pydantic
+                "response_schema": ObsidianNoteSchema  # FIX C: schema dari level modul
             }
         )
 
         try:
-            import json
-            # Sebelum dloads, kita bersihkan karakter kontrol liar yang lolos secara preventif
+            # FIX B: json sudah di-import di atas — tidak perlu import ulang di sini
             clean_text = response.text.strip()
             result = json.loads(clean_text)
             return result
@@ -159,19 +183,17 @@ Contoh yang salah: "Note ini berkaitan dengan [[file_relevan_nama]] karena memba
             return None
 
     def save_to_obsidian(self, judul: str, konten: str) -> str:
-        """Simpan catatan ke Obsidian vault"""
-        import re
-        
-        # Sanitasi karakter ilegal dari nama file (Windows & Linux)
+        """Simpan catatan ke Obsidian vault. Return path file jika sukses, string kosong jika gagal."""
+        # FIX A: re sudah di-import di atas — tidak perlu import ulang di sini
         judul_bersih = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '-', judul)
-        judul_bersih = judul_bersih.strip('. ')  # Hapus titik/spasi di ujung
-        judul_bersih = judul_bersih[:100]        # Batasi panjang nama file
-        
+        judul_bersih = judul_bersih.strip('. ')
+        judul_bersih = judul_bersih[:FILENAME_MAX_LEN]  # FIX D: pakai konstanta
+
         filename = f"{judul_bersih}.md"
         full_path = os.path.join(self.obsidian_path, filename)
-        
-        print(f"--> [Obsidian] Mencoba nulis ke: {full_path}")  # ← Debug ini dulu!
-        
+
+        print(f"--> [Obsidian] Mencoba nulis ke: {full_path}")   # FIX E: hapus komentar debug lama
+
         try:
             with open(full_path, 'w', encoding='utf-8') as f:
                 f.write(konten)
