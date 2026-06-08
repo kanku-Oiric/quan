@@ -159,7 +159,7 @@ Contoh yang benar: "Konsep X di note ini menjadi input langsung untuk langkah 2 
 Contoh yang salah: "Note ini berkaitan dengan [[file_relevan_nama]] karena membahas topik serupa"]
 
 **Link tambahan yang relevan (hanya dari WHITELIST):**
-[Jika ada — sebutkan nama dan kenapa spesifik relevan]
+[Jika ada — sebutkan nama dan kenapa spesifik relevan ]
 """
 
         print("--> [Researcher] Mengirim prompt ke Gemini API...")
