@@ -1,23 +1,28 @@
 import os
-import re                               # FIX A: pindah ke atas, bukan di dalam fungsi
-import json                             # FIX B: pindah ke atas, bukan di dalam fungsi
+import re
+import json
+import time                             # untuk retry sleep
 import warnings
 from google import genai
 from pypdf import PdfReader
-from pydantic import BaseModel          # FIX C: pindah ke atas, bukan di dalam fungsi
+from pydantic import BaseModel
 
 warnings.filterwarnings("ignore")
 
 # =====================================================================
-# KONSTANTA — FIX D: gak ada lagi magic number tersebar di fungsi
+# KONSTANTA
 # =====================================================================
 GEMINI_MODEL      = "gemini-2.5-flash"
-PDF_CHAR_LIMIT    = 8000               # FIX 5: dinaikkan dari 4000 → 8000, mudah diubah di sini
+PDF_CHAR_LIMIT    = 8000
 FILENAME_MAX_LEN  = 100
+MAX_RETRIES       = 3                  # total percobaan: 1 awal + 2 retry
+RETRY_BASE_DELAY  = 5                  # detik; actual waits: 5s, 10s (exponential)
+
+# Error codes yang layak di-retry (transient server-side errors)
+RETRYABLE_CODES   = ("503", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED")
 
 # =====================================================================
-# SCHEMA PYDANTIC — FIX C: definisi di level modul, bukan di-recreate
-#                           setiap kali analyze_and_link() dipanggil
+# SCHEMA PYDANTIC
 # =====================================================================
 class ObsidianNoteSchema(BaseModel):
     judul: str
@@ -39,8 +44,6 @@ class AIResearcher:
                 extracted = page.extract_text()
                 if extracted:
                     text += extracted + "\n"
-                # FIX 5: stop lebih awal kalau sudah melewati limit,
-                # daripada ekstrak semua baru dipotong di akhir
                 if len(text) >= PDF_CHAR_LIMIT:
                     break
             return text[:PDF_CHAR_LIMIT]
@@ -57,8 +60,8 @@ class AIResearcher:
         daftar_semua_judul: list = None
     ) -> dict | None:
         """
-        Pipeline utama: bangun prompt → kirim ke Gemini → parse JSON.
-        Return dict {judul, konten} atau None jika gagal.
+        Pipeline utama: bangun prompt → kirim ke Gemini (dengan retry) → parse JSON.
+        Return dict {judul, konten} atau None jika semua retry habis / error fatal.
         """
         format_judul_saja = (
             "\n".join([f"- {j}" for j in daftar_semua_judul])
@@ -159,21 +162,52 @@ Contoh yang benar: "Konsep X di note ini menjadi input langsung untuk langkah 2 
 Contoh yang salah: "Note ini berkaitan dengan [[file_relevan_nama]] karena membahas topik serupa"]
 
 **Link tambahan yang relevan (hanya dari WHITELIST):**
-[Jika ada — sebutkan nama dan kenapa spesifik relevan ]
+[Jika ada — sebutkan nama dan kenapa spesifik relevan]
 """
 
-        print("--> [Researcher] Mengirim prompt ke Gemini API...")
-        response = self.client.models.generate_content(
-            model=GEMINI_MODEL,                         # FIX D: pakai konstanta
-            contents=prompt,
-            config={
-                "response_mime_type": "application/json",
-                "response_schema": ObsidianNoteSchema  # FIX C: schema dari level modul
-            }
-        )
+        # ─────────────────────────────────────────────────────────────────
+        # RETRY LOOP
+        # 503 UNAVAILABLE dan 429 RESOURCE_EXHAUSTED adalah transient errors
+        # dari sisi server Gemini — bukan bug di code kita. Solusinya: tunggu
+        # sebentar dan coba lagi. Pakai exponential backoff: 5s → 10s → give up.
+        #
+        # Error fatal (400, 401, 403) langsung return None — retry gak akan bantu.
+        # ─────────────────────────────────────────────────────────────────
+        response = None
+
+        for attempt in range(MAX_RETRIES):
+            print(f"--> [Researcher] Mengirim prompt ke Gemini API... (attempt {attempt + 1}/{MAX_RETRIES})")
+            try:
+                response = self.client.models.generate_content(
+                    model=GEMINI_MODEL,
+                    contents=prompt,
+                    config={
+                        "response_mime_type": "application/json",
+                        "response_schema": ObsidianNoteSchema
+                    }
+                )
+                break  # sukses — keluar dari retry loop
+
+            except Exception as e:
+                error_str = str(e)
+                is_retryable = any(code in error_str for code in RETRYABLE_CODES)
+                remaining = MAX_RETRIES - 1 - attempt
+
+                if is_retryable and remaining > 0:
+                    wait = RETRY_BASE_DELAY * (2 ** attempt)  # 5s, lalu 10s
+                    print(f"⚠️ [Gemini] {e}")
+                    print(f"   → Transient error. Retry dalam {wait}s... ({remaining} percobaan tersisa)")
+                    time.sleep(wait)
+                else:
+                    # Fatal error (400/401/403) atau semua retry habis
+                    print(f"❌ [Gemini] Error: {e}")
+                    return None
+
+        if response is None:
+            print("❌ [Gemini] Semua retry habis. Return None.")
+            return None
 
         try:
-            # FIX B: json sudah di-import di atas — tidak perlu import ulang di sini
             clean_text = response.text.strip()
             result = json.loads(clean_text)
             return result
@@ -184,15 +218,14 @@ Contoh yang salah: "Note ini berkaitan dengan [[file_relevan_nama]] karena memba
 
     def save_to_obsidian(self, judul: str, konten: str) -> str:
         """Simpan catatan ke Obsidian vault. Return path file jika sukses, string kosong jika gagal."""
-        # FIX A: re sudah di-import di atas — tidak perlu import ulang di sini
         judul_bersih = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '-', judul)
         judul_bersih = judul_bersih.strip('. ')
-        judul_bersih = judul_bersih[:FILENAME_MAX_LEN]  # FIX D: pakai konstanta
+        judul_bersih = judul_bersih[:FILENAME_MAX_LEN]
 
         filename = f"{judul_bersih}.md"
         full_path = os.path.join(self.obsidian_path, filename)
 
-        print(f"--> [Obsidian] Mencoba nulis ke: {full_path}")   # FIX E: hapus komentar debug lama
+        print(f"--> [Obsidian] Mencoba nulis ke: {full_path}")
 
         try:
             with open(full_path, 'w', encoding='utf-8') as f:

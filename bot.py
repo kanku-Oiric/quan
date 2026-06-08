@@ -1,5 +1,5 @@
 import os
-import asyncio                          # FIX 3: pindah ke atas, bukan di dalam loop
+import asyncio
 import discord
 import numpy as np
 import warnings
@@ -9,6 +9,7 @@ from turbovec import TurboQuantIndex
 from researcher import AIResearcher
 from dotenv import load_dotenv
 from datetime import datetime, timedelta, timezone
+from feeder import auto_feed_to_obsidian
 
 warnings.filterwarnings("ignore")
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
@@ -45,15 +46,12 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # =====================================================================
-# FUNGSI RE-INDEX LOKAL
+# FUNGSI RE-INDEX LOKAL (synchronous — selalu panggil via run_in_executor)
 # =====================================================================
 def refresh_local_vector_index():
-    """Membaca folder Obsidian dan memasukkannya ke Turbovec lokal (0 Token Cloud).
-    Fungsi ini SINKRONUS — selalu panggil via run_in_executor agar tidak block event loop."""
     global metadata_lokal, index
     metadata_lokal = []
     all_vectors = []
-
     index = TurboQuantIndex(dim=384, bit_width=4)
 
     if not os.path.exists(OBSIDIAN_VAULT_PATH):
@@ -83,15 +81,9 @@ def refresh_local_vector_index():
     return False
 
 # =====================================================================
-# FIX 1 & 4: HELPER — CARI KONTEKS RELEVAN (GANTI 3x COPY-PASTE)
+# HELPER — CARI KONTEKS RELEVAN
 # =====================================================================
 def cari_konteks_relevan(query_text: str) -> tuple[str, str, list]:
-    """
-    Cari 1 file paling relevan dari vault pakai TurboVec lokal.
-    Dipanggil dari !brain, !sync_time, dan on_message — satu sumber kebenaran.
-
-    Return: (file_relevan_nama, file_relevan_konten, daftar_semua_judul)
-    """
     file_relevan_nama = "Tidak ada"
     file_relevan_konten = "Tidak ada konteks lama yang mirip."
 
@@ -110,39 +102,41 @@ def cari_konteks_relevan(query_text: str) -> tuple[str, str, list]:
     return file_relevan_nama, file_relevan_konten, daftar_semua_judul
 
 # =====================================================================
-# FIX 1, 2 & 4: HELPER — PIPELINE PENUH (TURBOVEC → GEMINI → OBSIDIAN)
+# HELPER — PIPELINE PENUH (TURBOVEC → GEMINI → OBSIDIAN)
 # =====================================================================
 async def proses_dan_simpan(query_text: str, pdf_local_path: str = None) -> tuple[dict | None, str]:
-    """
-    Jalankan pipeline lengkap dari satu titik:
-      1. Cari konteks relevan (TurboVec lokal)
-      2. Kirim ke Gemini API (dengan try/except — FIX 2)
-      3. Simpan ke Obsidian (run_in_executor — FIX 4)
-      4. Refresh index (run_in_executor — FIX 4)
+    loop = asyncio.get_running_loop()
 
-    Return: (hasil_dict, file_relevan_nama)
-            hasil_dict = None jika Gemini gagal.
-    """
     # Step 1: Cari konteks lokal (sinkronus tapi cepat)
     file_relevan_nama, file_relevan_konten, daftar_semua_judul = cari_konteks_relevan(query_text)
 
-    # Step 2: Kirim ke Gemini — FIX 2: try/except ada di SINI, bukan tersebar
+    # Step 2: Kirim ke Gemini
+    # ─────────────────────────────────────────────────────────────────
+    # BUG ASLI ADA DI SINI. analyze_and_link() pakai httpx synchronous
+    # client di balik layar (via google-genai SDK). Tanpa run_in_executor,
+    # ini block seluruh event loop asyncio selama 10–60 detik sambil nunggu
+    # response Gemini → Discord heartbeat mati → WARNING "heartbeat blocked".
+    #
+    # Fix: wrap di run_in_executor sama persis seperti save + reindex di bawah.
+    # ─────────────────────────────────────────────────────────────────
     hasil = None
     try:
-        hasil = researcher.analyze_and_link(
-            discord_chat=query_text,
-            pdf_path=pdf_local_path,
-            file_relevan_nama=file_relevan_nama,
-            file_relevan_konten=file_relevan_konten,
-            daftar_semua_judul=daftar_semua_judul
+        hasil = await loop.run_in_executor(
+            None,
+            lambda: researcher.analyze_and_link(
+                discord_chat=query_text,
+                pdf_path=pdf_local_path,
+                file_relevan_nama=file_relevan_nama,
+                file_relevan_konten=file_relevan_konten,
+                daftar_semua_judul=daftar_semua_judul
+            )
         )
     except Exception as e:
         print(f"❌ [Gemini] Error: {e}")
         return None, file_relevan_nama
 
-    # Step 3 & 4: Simpan + re-index di thread terpisah — FIX 4: non-blocking
+    # Step 3 & 4: Simpan + re-index di thread terpisah
     if hasil:
-        loop = asyncio.get_running_loop()
         path_tersimpan = await loop.run_in_executor(
             None,
             lambda: researcher.save_to_obsidian(hasil['judul'], hasil['konten'])
@@ -150,29 +144,57 @@ async def proses_dan_simpan(query_text: str, pdf_local_path: str = None) -> tupl
         if path_tersimpan:
             await loop.run_in_executor(None, refresh_local_vector_index)
         else:
-            # Kalau save gagal, anggap hasil invalid
             return None, file_relevan_nama
 
     return hasil, file_relevan_nama
-
+async def news_feeder_loop():
+    await bot.wait_until_ready()
+    loop = asyncio.get_running_loop()
+    
+    while not bot.is_closed():
+        print("⚡ [Auto-Pilot Feeder] Memulai background scraping berita...")
+        try:
+            # 💡 Jalankan scraping web di thread terpisah biar gak blocking
+            await loop.run_in_executor(None, auto_feed_to_obsidian) 
+            
+            # 💡 Jalankan re-indexing lokal di thread terpisah juga
+            print("🧠 [Auto-Pilot Feeder] Sinkronisasi memori baru ke Turbovec...")
+            await loop.run_in_executor(None, refresh_local_vector_index)
+            
+        except Exception as e:
+            print(f"❌ Feeder error: {e}")
+            
+        # Jeda waktu looping (6 jam)
+        await asyncio.sleep(21600)
 # =====================================================================
-# ON READY: Re-index awal — FIX 4: jalankan di executor
+# ON READY
 # =====================================================================
 @bot.event
 async def on_ready():
     print("--> [Bot] Menyinkronkan catatan Obsidian ke Turbovec...")
     loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, refresh_local_vector_index)  # FIX 4
+    await loop.run_in_executor(None, refresh_local_vector_index)
     print(f"✅ Bot Discord siap digunakan! Login sebagai: {bot.user}")
 
+# =====================================================================
+# ON READY & BACKGROUND TASK TRIGGER
+# =====================================================================
+@bot.event
+async def on_ready():
+    print("--> [Bot] Menyinkronkan catatan Obsidian ke Turbovec...")
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, refresh_local_vector_index)
+    print(f"✅ Bot Discord siap digunakan! Login sebagai: {bot.user}")
+    
+    # 🔥 FIX: Daftarkan background task feeder di sini pake loop aktif
+    print("📅 [System] Mengaktifkan Auto-Pilot Feeder loop...")
+    loop.create_task(news_feeder_loop())
 # =====================================================================
 # PERINTAH UTAMA: !brain
 # =====================================================================
 @bot.command(name="brain")
 @commands.cooldown(1, 30, commands.BucketType.user)
 async def process_to_brain(ctx, *, argumen_chat: str = ""):
-    """Perintah untuk memproses chat/PDF menjadi Knowledge Graph di Obsidian"""
-
     async with ctx.typing():
         pdf_local_path = None
         attachment = None
@@ -191,7 +213,6 @@ async def process_to_brain(ctx, *, argumen_chat: str = ""):
 
         await ctx.send("🧠 *Turbovec berhasil menyaring memori. Menghubungi Gemini cloud...*")
 
-        # Satu baris — semua logik duplikat sudah masuk ke helper (FIX 1, 2, 4)
         hasil, file_relevan_nama = await proses_dan_simpan(query_text, pdf_local_path)
 
         if pdf_local_path and os.path.exists(pdf_local_path):
@@ -214,17 +235,12 @@ async def process_to_brain(ctx, *, argumen_chat: str = ""):
 @bot.command(name="sync_time")
 @commands.has_permissions(administrator=True)
 async def sync_channel_by_time(ctx, jumlah_hari: int = 7):
-    """
-    Cara pakai di Discord: !sync_time 7
-    (Bot bakal otomatis nyari semua PDF yang diupload dalam 7 hari terakhir)
-    """
     if TARGET_CHANNEL_ID and ctx.channel.id != TARGET_CHANNEL_ID:
         await ctx.send("❌ Perintah ini cuma bisa dijalankan di channel khusus PDF lu!")
         return
 
     waktu_sekarang = datetime.now(timezone.utc)
     waktu_batas_awal = waktu_sekarang - timedelta(days=jumlah_hari)
-
     waktu_lokal_print = waktu_batas_awal.astimezone()
     await ctx.send(
         f"⏳ *Auto-System: Menyapu sejarah sejak [{waktu_lokal_print.strftime('%Y-%m-%d %H:%M')}] "
@@ -254,7 +270,6 @@ async def sync_channel_by_time(ctx, jumlah_hari: int = 7):
                     else f"Analisis dokumen rentang waktu: {attachment.filename}"
                 )
 
-                # FIX 1, 2, 4: Satu panggilan — try/except + non-blocking sudah di dalam helper
                 hasil, _ = await proses_dan_simpan(query_text, pdf_local_path)
 
                 if os.path.exists(pdf_local_path):
@@ -263,7 +278,7 @@ async def sync_channel_by_time(ctx, jumlah_hari: int = 7):
                 if not hasil:
                     await ctx.send(f"⚠️ Gagal memproses `{attachment.filename}`. Lanjut ke file berikutnya...")
 
-                await asyncio.sleep(3)   # FIX 3: asyncio sudah di-import di atas
+                await asyncio.sleep(3)
 
     await ctx.send(
         f"✨ **SINKRONISASI SELESAI!** "
@@ -298,7 +313,6 @@ async def on_message(message):
                         else f"Analisis dokumen ilmiah: {attachment.filename}"
                     )
 
-                    # FIX 1, 2, 4: Satu panggilan — semua pipeline di helper
                     hasil, file_relevan_nama = await proses_dan_simpan(query_text, pdf_local_path)
 
                     if os.path.exists(pdf_local_path):
@@ -316,8 +330,6 @@ async def on_message(message):
                     else:
                         await message.channel.send("❌ Auto-System gagal memproses via Gemini API.")
 
-    # CRITICAL: Wajib ada di sini biar !brain dan !sync_time tetap jalan
     await bot.process_commands(message)
 
-# Jalankan bot Discord lu (taruh paling bawah file)
 bot.run(DISCORD_BOT_TOKEN)
